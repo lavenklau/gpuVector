@@ -19,4 +19,17 @@
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="test_gVector.cu">
+      <Filter>源文件</Filter>
+    </CudaCompile>
+    <CudaCompile Include="gpuVector.cu">
+      <Filter>源文件</Filter>
+    </CudaCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="gpuVector.cuh">
+      <Filter>头文件</Filter>
+    </ClInclude>
+  </ItemGroup>
 </Project>

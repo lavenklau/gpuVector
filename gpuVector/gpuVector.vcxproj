@@ -97,6 +97,9 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
+    <CudaCompile>
+      <AdditionalOptions>--std=c++17  --extended-lambda %(AdditionalOptions)</AdditionalOptions>
+    </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -156,7 +159,6 @@
   </ItemGroup>
   <ItemGroup>
     <CudaCompile Include="gpuVector.cu" />
-    <CudaCompile Include="test_gVector.cu" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="gpuVector.cuh" />

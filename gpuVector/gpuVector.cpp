@@ -1,11 +1,9 @@
-#include "gpuVector.h"
 #include "iostream"
+#include "algorithm"
 
-#ifdef __GVECTOR_WITH_MATLAB
-#include "matlab_utils.h"
-#include "Eigen\Eigen"
-#endif
+extern void test_gVector(void);
 
-using namespace gv;
+int main(void) {
 
-
+	test_gVector();
+}

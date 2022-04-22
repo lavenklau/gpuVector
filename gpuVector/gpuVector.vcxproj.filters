@@ -20,9 +20,6 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <CudaCompile Include="test_gVector.cu">
-      <Filter>源文件</Filter>
-    </CudaCompile>
     <CudaCompile Include="gpuVector.cu">
       <Filter>源文件</Filter>
     </CudaCompile>

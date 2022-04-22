@@ -1,7 +1,4 @@
-#include"gpuVector.h"
-//#include"cublas.h"
 #include"cuda_runtime.h"
-//#include"lib.cuh"
 #include"vector"
 #include"gpuVector.cuh"
 

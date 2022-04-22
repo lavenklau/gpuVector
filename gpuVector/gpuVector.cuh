@@ -1,10 +1,6 @@
 #ifndef __GPU_VECTOR_CUH
 #define __GPU_VECTOR_CUH
 
-#include "gpuVector.h"
-
-#ifdef __USE_GVECTOR_LAZY_EVALUATION
-
 #include"cuda_runtime.h"
 #include"iostream"
 //#include"lib.cuh"
@@ -1681,9 +1677,6 @@ struct max_exp_t
 };
 
 
-/*******************************************************************************************
-*                         negate      expression                                           *
-********************************************************************************************/
 template<typename Scalar>
 negat_exp_t<var_t<Scalar>> operator-(const gVector<Scalar>& gvec) {
 	return negat_exp_t<var_t<Scalar>>(var_t<Scalar>(gvec));
@@ -1868,7 +1861,6 @@ DEFINE_BINEXP(pow, ^);
 
 };
 
-#endif
 
 #endif
 

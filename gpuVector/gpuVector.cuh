@@ -596,6 +596,8 @@ namespace gv {
 
 		void set(const Scalar* host_ptr);
 
+		void get(Scalar *host_ptr, size_t len, size_t offset = 0);
+
 		gVector(void) :_size(0), _data(nullptr) {}
 
 		//gVector(Scalar* host_ptr, size_t size);
@@ -1084,6 +1086,13 @@ namespace gv {
 			if (read_bit(filter, tid)) { ptr[tid] = val; }
 		});
 		cudaDeviceSynchronize();
+		cuda_error_check;
+	}
+
+	template <typename Scalar>
+	void gVector<Scalar>::get(Scalar *host_ptr, size_t len, size_t offset /*= 0*/) {
+		size_t wlen = (len + offset) < size() ? len :  (size() - offset);
+		cudaMemcpy(host_ptr, data() + offset, wlen * sizeof(Scalar), cudaMemcpyDeviceToHost);
 		cuda_error_check;
 	}
 

@@ -36,7 +36,10 @@ int main(void) {
     // transfer data from host to vector
     std::vector<float> vhost(10000);
     v1.set(vhost.data());  // set v1 to be the same as vhost, the length of vhost must not be less than length of v1
+    v1*=1.5f; 
     
+    v1.get(vhost.data(), 10000); // get the modifed vector data from device
+
     // resize the length of a vector
     v2.resize(1000);  // v2 will have new length of 1000
 }

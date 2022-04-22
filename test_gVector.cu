@@ -1,6 +1,6 @@
 #include"cuda_runtime.h"
 #include"vector"
-#include"gpuVector.cuh"
+#include"gpuVector/gpuVector.cuh"
 
 //#define __DEBUG_GVECTOR
 

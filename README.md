@@ -67,7 +67,7 @@ Most the functions of `gVector`  can be divided into two categories, *map* and *
 
 #### map
 
-* `minimize/maximize`: clamp the vector with a given upper/lower bound, they are down in place.
+* `minimize/maximize`: clamp the vector with a given upper/lower bound, they are done in place.
 * `min/max`: computes the small or larger value of two vectors and generate an expression of the result.
 * `clamp`: clamp the vector with two value or other two vectors.
 * `Sqrt`: element-wise square root .

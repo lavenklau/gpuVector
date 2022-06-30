@@ -3,6 +3,7 @@
 
 #include"cuda_runtime.h"
 #include"iostream"
+#include <vector>
 //#include"lib.cuh"
 #include"type_traits"
 #include <algorithm>
@@ -83,6 +84,15 @@ namespace gv {
 		int tid = blockDim.x*blockIdx.x + threadIdx.x;
 		if (tid >= array_size) return;
 		dst[tid] = graph.eval(tid);
+	}
+
+	template<typename Scalar, typename filter, typename replace_val>
+	__global__ void replace_filter_kernel(Scalar* dst, int array_size, filter f, replace_val v) {
+		int tid = blockDim.x*blockIdx.x + threadIdx.x;
+		if (tid >= array_size) return;
+		if (f.eval(tid)) {
+			dst[tid] = v.eval(tid);
+		}
 	}
 
 	template<typename Tin, int blockSize = 512, typename Tout = Tin>
@@ -547,7 +557,7 @@ namespace gv {
 	template<typename Scalar> class gVector;
 	template<typename Scalar> class gElementProxy;
 
-	template<typename... > struct is_expression;
+	template<typename > struct is_expression;
 	template<typename, typename> struct min_exp_t;
 	template<typename, typename> struct max_exp_t;
 	template<typename> struct sqrt_exp_t;
@@ -595,6 +605,54 @@ namespace gv {
 		void set(int* filter, Scalar val);
 
 		void set(const Scalar* host_ptr);
+
+		template<typename expr_t, typename expr_repl,
+			typename std::enable_if<is_expression<expr_t>::value, int>::type = 0,
+			typename std::enable_if<is_expression<expr_repl>::value, int>::type = 0
+		>
+			void set_filter_value(const expr_t& exprfilter, const expr_repl& repl_val) {
+			size_t expr_dim = exprfilter.size();
+			if (expr_dim != _size) {
+				throw std::string("unmatched vector size !");
+			}
+			size_t grid_size, block_size;
+			make_kernel_param(&grid_size, &block_size, expr_dim, 512);
+			Scalar* pdata = _data;
+			expr_t filter = exprfilter;
+			expr_repl replval = repl_val;
+			replace_filter_kernel << <grid_size, block_size >> > (pdata, expr_dim, filter, replval);
+			cudaDeviceSynchronize();
+			cuda_error_check;
+		}
+
+		void lambda_test(void) {
+			size_t grid_size = 10, block_size = 512;
+			auto kernel = [=] __device__(int eid) {
+				//if (filter.eval(eid)) {
+					//pdata[eid] = replval.eval(eid);
+				//}
+				return 0;
+			};
+			map << <grid_size, block_size >> > (_size, kernel);
+			cudaDeviceSynchronize();
+			cuda_error_check;
+		}
+
+		template<typename expr_t, typename T,
+			typename std::enable_if<is_expression<expr_t>::value, int>::type = 0,
+			typename std::enable_if<std::is_scalar_v<T>, int>::type = 0
+		>
+			void set(const expr_t& exprfilter, T repl_val) {
+			set_filter_value(exprfilter, scalar_t<T>(repl_val));
+		}
+
+		template<typename expr_t, typename T,
+			typename std::enable_if<is_expression<expr_t>::value, int>::type = 0,
+			typename std::enable_if<std::is_scalar_v<T>, int>::type = 0
+		>
+			void set(const expr_t& exprfilter, const gv::gVector<T>& repl_val) {
+			set_filter_value(exprfilter, var_t<T>(repl_val));
+		}
 
 		void get(Scalar *host_ptr, size_t len, size_t offset = 0);
 
@@ -922,7 +980,7 @@ namespace gv {
 
 	template<typename Scalar>
 	gElementProxy<Scalar> gVector<Scalar>::operator[](int eid) {
-		return gElementProxy(_data + eid);
+		return gElementProxy<Scalar>(_data + eid);
 	}
 
 	template<typename Scalar>
@@ -1355,10 +1413,10 @@ namespace gv {
 		}
 
 #if 1
-		template<typename Scalar, typename T, typename std::enable_if<std::is_same<T, gVector<Scalar>>::value, int>::type = 0>
-		min_exp_t<subExp_t, var_t<T>> min(const T& s) const {
+		template<typename Scalar, typename std::enable_if<std::is_scalar<Scalar>::value, int>::type = 0>
+		min_exp_t<subExp_t, var_t<Scalar>> min(const gVector<Scalar>& s) const {
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
-			return min_exp_t<subExp_t, var_t<T>>(*p_ex, var_t<T>(s));
+			return min_exp_t<subExp_t, var_t<Scalar>>(*p_ex, var_t<Scalar>(s));
 		}
 #else
 		template<typename T, typename std::enable_if<std::is_same<T, gVector>::value, int>::type = 0>
@@ -1380,10 +1438,10 @@ namespace gv {
 			return max_exp_t<subExp_t, scalar_t<T>>(*p_ex, scalar_t<T>(s));
 		}
 
-		template<typename Scalar, typename T, typename std::enable_if<std::is_same<T, gVector<Scalar>>::value, int>::type = 0>
-		max_exp_t<subExp_t, var_t<T>> max(const T& s) const {
+		template<typename Scalar, typename std::enable_if<std::is_scalar<Scalar>::value, int>::type = 0>
+		max_exp_t<subExp_t, var_t<Scalar>> max(const gVector<Scalar>& s) const {
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
-			return max_exp_t<subExp_t, var_t<T>>(*p_ex, var_t<T>(s));
+			return max_exp_t<subExp_t, var_t<Scalar>>(*p_ex, var_t<Scalar>(s));
 		}
 
 		template<typename Lambda>
@@ -1520,11 +1578,12 @@ struct scalar_t
 	}
 };
 
-template<typename subExp_t, typename opExp_t>
+template<typename Scalar, typename subExp_t, typename opExp_t>
 struct unary_exp_t
-	:public exp_t<typename exp_scalar_t<subExp_t>, subExp_t>
+	:public exp_t<Scalar, subExp_t>
 {
-	typedef exp_t<typename exp_scalar_t<subExp_t>, subExp_t>::value_type Scalar;
+	//typedef exp_t<Scalar, subExp_t>::value_type Scalar;
+	typedef Scalar Scalar;
 	opExp_t exp;
 	__host__ __device__ unary_exp_t(const opExp_t& opexp) :exp(opexp) {}
 	__host__ __device__ int size(void) const {
@@ -1534,43 +1593,50 @@ struct unary_exp_t
 
 template<typename opExp_t>
 struct negat_exp_t
-	:public unary_exp_t<negat_exp_t<opExp_t>, opExp_t>
+	:public unary_exp_t<typename exp_scalar_t<opExp_t>, negat_exp_t<opExp_t>, opExp_t>
 {
 	//typedef value_type Scalar;
-	typedef unary_exp_t<negat_exp_t<opExp_t>, opExp_t> baseType;
+	typedef unary_exp_t<typename exp_scalar_t<opExp_t>, negat_exp_t<opExp_t>, opExp_t> baseType;
 	typedef typename baseType::Scalar Scalar;
-	__host__ __device__ negat_exp_t(const opExp_t& ex) : unary_exp_t<negat_exp_t<opExp_t>, opExp_t>(ex) {}
+	__host__ __device__ negat_exp_t(const opExp_t& ex) : unary_exp_t<typename exp_scalar_t<opExp_t>, negat_exp_t<opExp_t>, opExp_t>(ex) {}
 	__device__ Scalar eval(int eid) const {
-		return -unary_exp_t<negat_exp_t<opExp_t>, opExp_t>::exp.eval(eid);
+		return -unary_exp_t<typename exp_scalar_t<opExp_t>, negat_exp_t<opExp_t>, opExp_t>::exp.eval(eid);
 	}
 };
 
+// define operator- on expression
+template<typename opExp_t, typename std::enable_if<is_expression<opExp_t>::value, int>::type = 0>
+negat_exp_t<opExp_t> operator-(const opExp_t& opexp) {
+	return negat_exp_t<opExp_t>(opexp);
+}
+
 template<typename opExp_t>
 struct sqrt_exp_t
-	:public unary_exp_t<sqrt_exp_t<opExp_t>, opExp_t>
+	:public unary_exp_t<typename exp_scalar_t<opExp_t>, sqrt_exp_t<opExp_t>, opExp_t>
 {
-	typedef unary_exp_t<sqrt_exp_t<opExp_t>, opExp_t> baseType;
+	typedef unary_exp_t<typename exp_scalar_t<opExp_t>, sqrt_exp_t<opExp_t>, opExp_t> baseType;
 	typedef typename baseType::Scalar Scalar;
-	__host__ __device__ sqrt_exp_t(const opExp_t& ex) :unary_exp_t<sqrt_exp_t<opExp_t>, opExp_t>(ex) {}
+	__host__ __device__ sqrt_exp_t(const opExp_t& ex) :unary_exp_t<typename exp_scalar_t<opExp_t>, sqrt_exp_t<opExp_t>, opExp_t>(ex) {}
 	__device__ Scalar eval(int eid) const {
-		return sqrt(unary_exp_t<sqrt_exp_t<opExp_t>, opExp_t>::exp.eval(eid));
+		return sqrt(unary_exp_t<typename exp_scalar_t<opExp_t>, sqrt_exp_t<opExp_t>, opExp_t>::exp.eval(eid));
 	}
 };
 
 template<typename opExp_t, typename Lambda>
 struct map_exp_t
-	:public unary_exp_t<map_exp_t<opExp_t, Lambda>, opExp_t>
+	:public unary_exp_t<typename exp_scalar_t<opExp_t>, map_exp_t<opExp_t, Lambda>, opExp_t>
 {
-	typedef unary_exp_t<map_exp_t<opExp_t, Lambda>, opExp_t> baseType;
+	typedef unary_exp_t<typename exp_scalar_t<opExp_t>, map_exp_t<opExp_t, Lambda>, opExp_t> baseType;
 	typedef typename baseType::Scalar Scalar;
 	Lambda _map;
 	__host__ __device__ map_exp_t(const opExp_t& ex, Lambda map)
-		: unary_exp_t<map_exp_t<opExp_t, Lambda>, opExp_t>(ex), _map(map)
+		: unary_exp_t<typename exp_scalar_t<opExp_t>, map_exp_t<opExp_t, Lambda>, opExp_t>(ex), _map(map)
 	{ }
 	__device__ Scalar eval(int eid) const {
-		return _map(unary_exp_t<map_exp_t<opExp_t, Lambda>, opExp_t>::exp.eval(eid));
+		return _map(unary_exp_t<typename exp_scalar_t<opExp_t>, map_exp_t<opExp_t, Lambda>, opExp_t>::exp.eval(eid));
 	}
 };
+
 
 template<typename subExp_t, typename opExp1_t, typename opExp2_t>
 struct binary_exp_t
@@ -1588,6 +1654,130 @@ struct binary_exp_t
 	__host__ __device__ int size(void) const {
 		return (std::max)(exp1.size(), exp2.size());
 	}
+};
+
+template<typename Comp> struct CompareVarsType;
+
+template<typename subCompare>
+struct Compare 
+{
+	__host__ __device__ bool operator()(
+		typename CompareVarsType<subCompare>::T1 var1,
+		typename CompareVarsType<subCompare>::T2 var2) {
+		return static_cast<const subCompare*>(this)->compare(var1, var2);
+	}
+};
+
+template<typename DT1, typename DT2>
+struct Less
+	: Compare<Less<DT1, DT2>>
+{
+	typedef DT1 T1; typedef DT2 T2;
+	__host__ __device__ bool compare(DT1 var1, DT2 var2) const { return var1 < var2; }
+};
+
+template<typename DT1, typename DT2>
+struct LessOrEqual
+	: Compare<LessOrEqual<DT1, DT2>>
+{
+	typedef DT1 T1; typedef DT2 T2;
+	__host__ __device__ bool compare(DT1 var1, DT2 var2) const { return var1 <= var2; }
+};
+
+template<typename DT1, typename DT2>
+struct Great
+	: Compare<Great<DT1, DT2>>
+{
+	typedef DT1 T1; typedef DT2 T2;
+	__host__ __device__ bool compare(DT1 var1, DT2 var2) const { return var1 > var2; }
+};
+
+template<typename DT1, typename DT2>
+struct GreatOrEqual
+	: Compare<GreatOrEqual<DT1, DT2>>
+{
+	typedef DT1 T1; typedef DT2 T2;
+	__host__ __device__ bool compare(DT1 var1, DT2 var2) const { return var1 >= var2; }
+};
+
+template<typename DT1, typename DT2>
+struct CompareVarsType<Less<DT1, DT2>> {
+	typedef DT1 T1;
+	typedef DT2 T2; 
+};
+
+template<typename DT1, typename DT2> 
+struct CompareVarsType<LessOrEqual<DT1, DT2>> {
+	typedef DT1 T1;
+	typedef DT2 T2; 
+};
+
+template<typename DT1, typename DT2> 
+struct CompareVarsType<Great<DT1, DT2>> {
+	typedef DT1 T1;
+	typedef DT2 T2; 
+};
+
+template<typename DT1, typename DT2> 
+struct CompareVarsType<GreatOrEqual<DT1, DT2>> {
+	typedef DT1 T1;
+	typedef DT2 T2; 
+};
+
+template<typename opExp1_t, typename opExp2_t, typename CompareOp>
+struct cmp_exp_t 
+	: public exp_t<bool, cmp_exp_t<opExp1_t, opExp2_t, CompareOp>>
+{
+	opExp1_t exp1;
+	opExp2_t exp2;
+	__host__ __device__ cmp_exp_t(const opExp1_t& op1, const opExp2_t& op2) : exp1(op1), exp2(op2) {}
+	__host__ __device__ int size(void) const {
+		return (std::max)(exp1.size(), exp2.size());
+	}
+	__device__ bool eval(int eid) const { return CompareOp()(exp1.eval(eid), exp2.eval(eid)); }
+};
+
+template<typename subExp>
+struct bool_exp_t
+	: exp_t<bool, bool_exp_t<subExp>>
+{
+	__host__ __device__ int size(void) const { return static_cast<const subExp*>(this)->size(); }
+	__device__ bool eval(int eid) const {
+		return static_cast<const subExp*>(this)->eval(eid);
+	}
+};
+
+template<typename opExp1_t, typename opExp2_t>
+struct and_exp_t
+	: bool_exp_t<and_exp_t<opExp1_t, opExp2_t>>
+{
+	opExp1_t exp1;
+	opExp2_t exp2;
+	__host__ __device__ and_exp_t(const opExp1_t& op1, const opExp2_t& op2) : exp1(op1), exp2(op2) {}
+	__device__ bool eval(int eid) const { return exp1.eval(eid) && exp2.eval(eid); }
+	__host__ __device__ int size(void) const { return (std::max)(exp1.size(), exp2.size()); }
+};
+
+template<typename opExp1_t, typename opExp2_t>
+struct or_exp_t
+	: bool_exp_t<or_exp_t<opExp1_t, opExp2_t>>
+{
+	opExp1_t exp1;
+	opExp2_t exp2;
+	__host__ __device__ or_exp_t(const opExp1_t& op1, const opExp2_t& op2) : exp1(op1), exp2(op2) {}
+	__device__ bool eval(int eid) const { return exp1.eval(eid) || exp2.eval(eid); }
+	__host__ __device__ int size(void) const { return (std::max)(exp1.size(), exp2.size()); }
+};
+
+template<typename opExp1_t, typename opExp2_t>
+struct xor_exp_t
+	:bool_exp_t<xor_exp_t<opExp1_t, opExp2_t>>
+{
+	opExp1_t exp1;
+	opExp2_t exp2;
+	__host__ __device__ xor_exp_t(const opExp1_t& op1, const opExp2_t& op2) : exp1(op1), exp2(op2) {}
+	__device__ bool eval(int eid) const { return exp1.eval(eid) ^ exp2.eval(eid); }
+	__host__ __device__ int size(void) const { return (std::max)(exp1.size(), exp2.size()); }
 };
 
 template<typename opExp1_t, typename opExp2_t>
@@ -1696,7 +1886,7 @@ template<typename Scalar1, typename Scalar2,  \
 std::enable_if_t<std::is_scalar_v<Scalar1>,int> = 0,  \
 std::enable_if_t<std::is_scalar_v<Scalar2>,int> = 0  \
 > \
-op##_exp_t<scalar_t<Scalar1>, var_t<Scalar2>> operator opsign( \
+op##_exp_t<scalar_t<Scalar1>, var_t<Scalar2>>  opsign( \
 	Scalar1 s,  \
 	const gVector<Scalar2>& v2  \
 	) {  \
@@ -1708,7 +1898,7 @@ template<typename Scalar1,typename Scalar2 , \
 std::enable_if_t<std::is_scalar_v<Scalar1>,int> = 0, \
 std::enable_if_t<std::is_scalar_v<Scalar2>,int> = 0 \
 >  \
-op##_exp_t<var_t<Scalar1>, scalar_t<Scalar2>> operator opsign(  \
+op##_exp_t<var_t<Scalar1>, scalar_t<Scalar2>>  opsign(  \
 	const gVector<Scalar1>& v1,  \
 	Scalar2 v2   \
 	) {  \
@@ -1720,7 +1910,7 @@ template<typename Scalar1,typename Scalar2, \
 typename std::enable_if<std::is_scalar_v<Scalar1>,int>::type = 0, \
 typename std::enable_if<std::is_scalar_v<Scalar2>,int>::type = 0 \
 >  \
-op##_exp_t<var_t<Scalar1>, var_t<Scalar2>> operator opsign(  \
+op##_exp_t<var_t<Scalar1>, var_t<Scalar2>>  opsign(  \
 	const gVector<Scalar1>& v1,  \
 	const gVector<Scalar2>& v2   \
 	) {  \
@@ -1731,7 +1921,7 @@ op##_exp_t<var_t<Scalar1>, var_t<Scalar2>> operator opsign(  \
 template<typename Scalar, typename opExp1_t,  \
 	std::enable_if_t<std::is_scalar_v<Scalar>, int> = 0, \
 	std::enable_if_t<is_expression<opExp1_t>::value, int> = 0 > \
-	op##_exp_t<opExp1_t, var_t<Scalar>> operator opsign( \
+	op##_exp_t<opExp1_t, var_t<Scalar>>  opsign( \
 		const opExp1_t& op1, const gVector<Scalar>& v2) { \
 	static_assert(opExp1_t::is_exp, "Not a vector expression"); \
 		return op##_exp_t<opExp1_t, var_t<Scalar>>(op1, var_t<Scalar>(v2)); \
@@ -1741,7 +1931,7 @@ template<typename Scalar, typename opExp1_t,  \
 template<typename Scalar, typename opExp2_t, \
     std::enable_if_t<std::is_scalar_v<Scalar>,int> = 0, \
 	std::enable_if_t<is_expression<opExp2_t>::value, int> = 0 > \
-	op##_exp_t<var_t<Scalar>, opExp2_t> operator opsign( \
+	op##_exp_t<var_t<Scalar>, opExp2_t>  opsign( \
 		const gVector<Scalar>& v1, \
 		const opExp2_t& op2 \
 		) {  \
@@ -1753,7 +1943,7 @@ template<typename Scalar, typename opExp2_t, \
 template<typename Scalar, typename opExp2_t,  \
     std::enable_if_t<std::is_scalar_v<Scalar>,int> = 0, \
 	typename std::enable_if<is_expression<opExp2_t>::value, int>::type = 0 >  \
-	op##_exp_t<scalar_t<Scalar>, opExp2_t > operator opsign(  \
+	op##_exp_t<scalar_t<Scalar>, opExp2_t >  opsign(  \
 		Scalar s1,  \
 		const opExp2_t& op2  \
 		) { \
@@ -1765,7 +1955,7 @@ template<typename Scalar, typename opExp2_t,  \
 template<typename Scalar, typename opExp1_t,  \
     std::enable_if_t<std::is_scalar_v<Scalar>,int> = 0, \
 	typename std::enable_if<is_expression<opExp1_t>::value, int>::type = 0 > \
-	op##_exp_t<opExp1_t, scalar_t<Scalar>> operator opsign( \
+	op##_exp_t<opExp1_t, scalar_t<Scalar>>  opsign( \
 		const opExp1_t& op1, \
 		Scalar s2 \
 		) { \
@@ -1777,7 +1967,7 @@ template<typename Scalar, typename opExp1_t,  \
 template<typename opExp1_t, typename opExp2_t, \
 	typename std::enable_if<is_expression<opExp1_t>::value, int>::type = 0, \
 	typename std::enable_if<is_expression<opExp2_t>::value, int>::type = 0 > \
-	op##_exp_t<opExp1_t, opExp2_t> operator opsign(  \
+	op##_exp_t<opExp1_t, opExp2_t>  opsign(  \
 		const opExp1_t& op1,  \
 		const opExp2_t& op2) {  \
 	static_assert(opExp1_t::is_exp, "Not a vector expression");  \
@@ -1797,10 +1987,176 @@ template<typename opExp1_t, typename opExp2_t, \
 
 //=============================================================================================================================
 
+#define DEFINE_CMP_SCALAR_VAR(CompareName, op) \
+template<typename Scalar1, typename Scalar2,  \
+	std::enable_if_t<std::is_scalar_v<Scalar1>, int> = 0,  \
+	std::enable_if_t<std::is_scalar_v<Scalar2>, int> = 0  \
+> \
+cmp_exp_t < scalar_t<Scalar1>, var_t<Scalar2>, CompareName <Scalar1, Scalar2 > > operator op( \
+	Scalar1 s,  \
+	const gVector<Scalar2>& v2   \
+	) {  \
+	return cmp_exp_t<scalar_t<Scalar1>, var_t<Scalar2>, CompareName <Scalar1, Scalar2 > >(scalar_t<Scalar1>(s), var_t<Scalar2>(v2)); \
+}
+
+#define DEFINE_CMP_VAR_SCALAR(CompareName, op)  \
+template<typename Scalar1, typename Scalar2,   \
+	std::enable_if_t<std::is_scalar_v<Scalar1>, int> = 0,  \
+	std::enable_if_t<std::is_scalar_v<Scalar2>, int> = 0  \
+>  \
+cmp_exp_t<var_t<Scalar1>, scalar_t<Scalar2>, CompareName <Scalar1, Scalar2> > operator op( \
+	const gVector<Scalar1>& v1,   \
+	Scalar2 v2    \
+	) {  \
+	return cmp_exp_t<var_t<Scalar1>, scalar_t<Scalar2>, CompareName <Scalar1, Scalar2> >(var_t<Scalar1>(v1), scalar_t<Scalar2>(v2));  \
+}
+
+#define DEFINE_CMP_VAR_VAR(CompareName, op)  \
+template<typename Scalar1,typename Scalar2, \
+typename std::enable_if<std::is_scalar_v<Scalar1>,int>::type = 0, \
+typename std::enable_if<std::is_scalar_v<Scalar2>,int>::type = 0 \
+>  \
+cmp_exp_t<var_t<Scalar1>, var_t<Scalar2>, CompareName <Scalar1, Scalar2> > operator op(  \
+	const gVector<Scalar1>& v1,  \
+	const gVector<Scalar2>& v2   \
+	) {  \
+	return cmp_exp_t<var_t<Scalar1>, var_t<Scalar2>, CompareName <Scalar1, Scalar2> >(var_t<Scalar1>(v1), var_t<Scalar2>(v2)); \
+}
+
+#define DEFINE_CMP_EXP_VAR(CompareName, op)  \
+template<typename Scalar, typename opExp1_t,  \
+	std::enable_if_t<std::is_scalar_v<Scalar>, int> = 0, \
+	std::enable_if_t<is_expression<opExp1_t>::value, int> = 0 > \
+	cmp_exp_t<opExp1_t, var_t<Scalar>, CompareName <exp_scalar_t<opExp1_t>, Scalar > > operator op( \
+		const opExp1_t& op1, const gVector<Scalar>& v2) { \
+	static_assert(opExp1_t::is_exp, "Not a vector expression"); \
+		return cmp_exp_t<opExp1_t, var_t<Scalar>, CompareName <exp_scalar_t<opExp1_t>, Scalar > >(op1, var_t<Scalar>(v2)); \
+}
+
+#define DEFINE_CMP_VAR_EXP(CompareName, op)  \
+template<typename Scalar, typename opExp2_t, \
+    std::enable_if_t<std::is_scalar_v<Scalar>,int> = 0, \
+	std::enable_if_t<is_expression<opExp2_t>::value, int> = 0 > \
+	cmp_exp_t<var_t<Scalar>, opExp2_t, CompareName <Scalar, exp_scalar_t<opExp2_t> > > operator op( \
+		const gVector<Scalar>& v1, \
+		const opExp2_t& op2 \
+		) {  \
+	static_assert(opExp2_t::is_exp, "Not a vector expression"); \
+	return cmp_exp_t<var_t<Scalar>, opExp2_t, CompareName <Scalar, exp_scalar_t<opExp2_t> > >(var_t<Scalar>(v1), op2); \
+}
+
+#define DEFINE_CMP_SCALAR_EXP(CompareName, op)  \
+template<typename Scalar, typename opExp2_t,  \
+    std::enable_if_t<std::is_scalar_v<Scalar>,int> = 0, \
+	typename std::enable_if<is_expression<opExp2_t>::value, int>::type = 0 >  \
+	cmp_exp_t<scalar_t<Scalar>, opExp2_t, CompareName <Scalar, exp_scalar_t<opExp2_t> >  > operator op(  \
+		Scalar s1,  \
+		const opExp2_t& op2  \
+		) { \
+	static_assert(opExp2_t::is_exp, "Not a vector expression"); \
+	return cmp_exp_t<scalar_t<Scalar>, opExp2_t, CompareName <Scalar, exp_scalar_t<opExp2_t> >  >(scalar_t<Scalar>(s1), op2); \
+}
+
+#define DEFINE_CMP_EXP_SCALAR(CompareName, op)  \
+template<typename Scalar, typename opExp1_t,  \
+    std::enable_if_t<std::is_scalar_v<Scalar>,int> = 0, \
+	typename std::enable_if<is_expression<opExp1_t>::value, int>::type = 0 > \
+	cmp_exp_t<opExp1_t, scalar_t<Scalar>, CompareName <exp_scalar_t<opExp1_t>,Scalar > > operator op( \
+		const opExp1_t& op1, \
+		Scalar s2 \
+		) { \
+	static_assert(opExp1_t::is_exp, "Not a vector expression"); \
+	return cmp_exp_t<opExp1_t, scalar_t<Scalar>, CompareName <exp_scalar_t<opExp1_t>,Scalar > >(op1, scalar_t<Scalar>(s2)); \
+}
+
+#define DEFINE_CMP_EXP_EXP(CompareName, op) \
+template<typename opExp1_t, typename opExp2_t, \
+	typename std::enable_if<is_expression<opExp1_t>::value, int>::type = 0, \
+	typename std::enable_if<is_expression<opExp2_t>::value, int>::type = 0 > \
+	cmp_exp_t<opExp1_t, opExp2_t, CompareName <exp_scalar_t<opExp1_t>, exp_scalar_t<opExp2_t> > > operator op(  \
+		const opExp1_t& op1,  \
+		const opExp2_t& op2) {  \
+	static_assert(opExp1_t::is_exp, "Not a vector expression");  \
+	static_assert(opExp2_t::is_exp, "Not a vector expression");  \
+	return cmp_exp_t<opExp1_t, opExp2_t, CompareName <exp_scalar_t<opExp1_t>, exp_scalar_t<opExp2_t> > >(op1, op2); \
+}
+
+#define DEFINE_CMP_EXP(CompareName, op)    DEFINE_CMP_SCALAR_VAR(CompareName, op)  \
+											DEFINE_CMP_VAR_SCALAR(CompareName, op)  \
+											DEFINE_CMP_VAR_VAR(CompareName, op)    \
+											DEFINE_CMP_EXP_VAR(CompareName, op)    \
+											DEFINE_CMP_VAR_EXP(CompareName, op)    \
+											DEFINE_CMP_SCALAR_EXP(CompareName, op) \
+											DEFINE_CMP_EXP_SCALAR(CompareName, op) \
+											DEFINE_CMP_EXP_EXP(CompareName, op) 
+
+// ============================================================================================================================
+
+#define DEFINE_LOGIC_OP_EXP_EXP(opname, opsign) \
+template<typename opExp1, typename opExp2, \
+	typename std::enable_if<is_expression<opExp1>::value, int>::type = 0, \
+	typename std::enable_if<is_expression<opExp2>::value, int>::type = 0\
+> opname##_exp_t <opExp1, opExp2> operator opsign (const opExp1& op1, const opExp2& op2) {\
+	return opname##_exp_t<opExp1, opExp2>(op1,op2);\
+}
+
+#define DEFINE_LOGIC_OP_EXP_BOOL(opname,opsign) \
+template<typename opExp1, \
+	typename std::enable_if<is_expression<opExp1>::value, int>::type = 0 \
+> opname##_exp_t <opExp1, scalar_t<bool>> operator opsign (const opExp1& op1, bool v){ \
+	return opname##_exp_t<opExp1, scalar_t<bool>> ( op1, scalar_t<bool>(v)); \
+}
+
+#define DEFINE_LOGIC_OP_BOOL_EXP(opname, opsign) \
+template<typename opExp2,  \
+	typename std::enable_if<is_expression<opExp2>::value, int>::type = 0 \
+> opname##_exp_t <scalar_t<bool>, opExp2> operator opsign (bool v, const opExp2& op2){ \
+	return opname##_exp_t<scalar_t<bool>, opExp2> (scalar_t<bool>(v), op2); \
+}
+
+#define DEFINE_LOGIC_OP_EXP_VAR(opname, opsign) \
+template<typename opExp1, \
+	typename std::enable_if<is_expression<opExp1>::value, int>::type = 0 \
+> opname##_exp_t <opExp1, var_t<bool>> operator opsign (const opExp1& op1, const gVector<bool>& v){ \
+	return opname##_exp_t<opExp1, var_t<bool>> (op1, var_t<bool>(v)); \
+}
+
+#define DEFINE_LOGIC_OP_VAR_EXP(opname, opsign) \
+template<typename opExp2, \
+	typename std::enable_if<is_expression<opExp2>::value, int>::type = 0 \
+> opname##_exp_t <var_t<bool>, opExp2> operator opsign (const gVector<bool>& v, const opExp2& op2){ \
+	return opname##_exp_t<var_t<bool>, opExp2> (var_t<bool>(v), op2); \
+}
+
+#define DEFINE_LOGIC_OP(opname, opsign) DEFINE_LOGIC_OP_EXP_EXP(opname, opsign) \
+										DEFINE_LOGIC_OP_EXP_BOOL(opname, opsign) \
+										DEFINE_LOGIC_OP_BOOL_EXP(opname, opsign) \
+										DEFINE_LOGIC_OP_EXP_VAR(opname, opsign) \
+										DEFINE_LOGIC_OP_VAR_EXP(opname, opsign)
+
+
+// ============================================================================================================================
+
 template<typename _T,typename _T2>
 struct is_expression_impl {
 	static constexpr bool value = false;
 };
+
+template<typename _T, int v>
+struct is_expression<scalar_t<_T, v>> {
+	static constexpr bool value = true;
+};
+
+template<typename _T, int V>
+struct is_expression < var_t<_T, gVector<_T>, V>> {
+	static constexpr bool value = true;
+};
+
+//constexpr bool ts = is_expression< var_t<gv::gVector<double> > >::value;
+//template<typename... _T>
+//struct is_expression<negat_exp_t<_T...>> {
+//	static constexpr bool value = true;
+//};
 
 template<typename... _T>
 struct is_expression<add_exp_t<_T...>> {
@@ -1851,6 +2207,26 @@ template<typename... _T>
 struct is_expression<min_exp_t<_T...>> {
 	static constexpr bool value = true;
 };
+
+template<typename... _T>
+struct is_expression<cmp_exp_t<_T...>> {
+	static constexpr bool value = true;
+};
+
+template<typename... _T>
+struct is_expression<and_exp_t<_T...>> {
+	static constexpr bool value = true;
+};
+
+template<typename... _T>
+struct is_expression<or_exp_t<_T...>> {
+	static constexpr bool value = true;
+};
+
+template<typename... _T>
+struct is_expression<xor_exp_t<_T...>> {
+	static constexpr bool value = true;
+};
 //=============================================================================================================================
 
 
@@ -1862,11 +2238,48 @@ negat_exp_t<opExp_t> operator-(
 }
 
 // bindary expression definition
-DEFINE_BINEXP(add, +);
-DEFINE_BINEXP(minus, -);
-DEFINE_BINEXP(multiply, *);
-DEFINE_BINEXP(div, / );
-DEFINE_BINEXP(pow, ^);
+DEFINE_BINEXP(add, operator+);
+DEFINE_BINEXP(minus, operator-);
+DEFINE_BINEXP(multiply, operator*);
+DEFINE_BINEXP(div, operator/);
+#if 0
+DEFINE_BINEXP(pow, operator^);
+#else
+DEFINE_BINEXP(pow, power);
+#endif
+
+//DEFINE_CMP_EXP(Less, < );
+#if 1
+#define DEFINE_CMP_EXP(CompareName, op)    DEFINE_CMP_SCALAR_VAR(CompareName, op)  \
+											DEFINE_CMP_VAR_SCALAR(CompareName, op)  \
+											DEFINE_CMP_VAR_VAR(CompareName, op)    \
+											DEFINE_CMP_EXP_VAR(CompareName, op)    \
+											DEFINE_CMP_VAR_EXP(CompareName, op)    \
+											DEFINE_CMP_SCALAR_EXP(CompareName, op) \
+											DEFINE_CMP_EXP_SCALAR(CompareName, op) \
+											DEFINE_CMP_EXP_EXP(CompareName, op) 
+
+DEFINE_CMP_EXP(Less, < );
+DEFINE_CMP_EXP(LessOrEqual, <=);
+DEFINE_CMP_EXP(Great, >);
+DEFINE_CMP_EXP(GreatOrEqual, >=);
+#else
+DEFINE_CMP_VAR_SCALAR(Great, > );
+#endif
+
+#if 1
+
+DEFINE_LOGIC_OP(and, &&);
+DEFINE_LOGIC_OP(or , || );
+DEFINE_LOGIC_OP(xor, ^);
+#else
+DEFINE_LOGIC_OP_EXP_EXP(and, &&);
+DEFINE_LOGIC_OP_EXP_BOOL(and, &&);
+DEFINE_LOGIC_OP_BOOL_EXP(and, &&);
+DEFINE_LOGIC_OP_EXP_VAR(and, &&);
+DEFINE_LOGIC_OP_VAR_EXP(and, &&);
+
+#endif
 
 };
 

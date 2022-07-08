@@ -11,9 +11,7 @@ Download the file `gpuVector/gpuVector.cuh`,  and include it in you `.cu` files.
 
 ### initialization
 
-The initialization function `gVector::Init(size_t len)` should be called before any usage. This function preallocates buffer for many reduce operation, say `sum`, `max`, `norm` , etc. 
-
-The buffer length `len`，should be at least `max_len/512` , where `max_len`  is the maximal vector length you will create in you application . See the example:
+The initialization function `gVector::Init(size_t len)` should be called before any usage. This function preallocates buffer for many reduce operation, say `sum`, `max`, `norm` , etc.  See the example:
 
 ```cpp
 // test.cu

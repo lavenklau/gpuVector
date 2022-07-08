@@ -8,6 +8,15 @@
 #include"type_traits"
 #include <algorithm>
 
+#define GVECTOR_WITH_MATLAB
+
+#if defined(GVECTOR_WITH_MATLAB)  
+extern void pass_matrix_to_matlab(const char* namestr, float* pdata, int nrows, int ncols, int wordpitch, bool rowmajor = false);
+extern void pass_matrix_to_matlab(const char* namestr, double* pdata, int nrows, int ncols, int wordpitch, bool rowmajor = false);
+extern void pass_matrix_to_matlab(const char* namestr, int* pdata, int nrows, int ncols, int wordpitch, bool rowmajor = false);
+extern void pass_matrix_to_matlab(const char* namestr, bool* pdata, int nrows, int ncols, int wordpitch, bool rowmajor = false);
+#endif
+
 #define cuda_error_check do{ \
 	auto err = cudaGetLastError(); \
 	if (err != 0) { \
@@ -19,6 +28,25 @@
 	===========     define computation kernel      =========== 
 */
 namespace gv {
+	template<int N>
+	__host__ __device__ int round(int n) {
+		if (n % N == 0) {
+			return n;
+		} else {
+			int rn = (n + (N - 1)) / N * N;
+			return rn;
+		}
+	};
+
+	__host__ __device__ int round(int n, int N) {
+		if (n % N == 0) {
+			return n;
+		} else {
+			int rn = (n + (N - 1)) / N * N;
+			return rn;
+		}
+	}
+
 	template<typename T>
 	__global__ void init_array_kernel(T* array, T value, int array_size) {
 		int tid = blockIdx.x*blockDim.x + threadIdx.x;
@@ -26,6 +54,8 @@ namespace gv {
 			array[tid] = value;
 		}
 	}
+
+
 	// define some kernel function
 	template <typename T, unsigned int blockSize>
 	__device__ void warpReduce(volatile T *sdata, unsigned int tid) {
@@ -56,6 +86,22 @@ namespace gv {
 		if (blockSize >= 4) { T s = sdata[tid + 2]; if (sdata[tid] > s) sdata[tid] = s; };
 		if (blockSize >= 2) { T s = sdata[tid + 1]; if (sdata[tid] > s) sdata[tid] = s; };
 	}
+
+	template<typename T, unsigned int blockSize>
+	__device__ void blockReduce(volatile T * sdata) {
+		int len = blockSize;
+		while (len > 64) {
+			len /= 2;
+			if (threadIdx.x < len) {
+				sdata[threadIdx.x] += sdata[threadIdx.x + len];
+			}
+			__syncthreads();
+		}
+		if (threadIdx.x < 32) {
+			warpReduce<T, blockSize>(sdata, threadIdx.x);
+		}
+	}
+
 	template<typename T, typename Tout, typename Lam>
 	__global__ void map(T* g_data, Tout* dst, int n, Lam func) {
 		int tid = blockIdx.x*blockDim.x + threadIdx.x;
@@ -408,9 +454,9 @@ namespace gv {
 		}
 	}
 
-	template<typename T>
+	template<typename T, int blockSize = 512>
 	T parallel_max(const T* indata, T* dump, size_t array_size, T* max_dst = nullptr) {
-		constexpr int blockSize = 512;
+		//constexpr int blockSize = 512;
 		size_t grid_dim, block_dim;
 		make_kernel_param(&grid_dim, &block_dim, array_size, blockSize);
 		block_max_kernel << <grid_dim, block_dim >> > (indata, dump, array_size);
@@ -560,7 +606,11 @@ namespace gv {
 	template<typename > struct is_expression;
 	template<typename, typename> struct min_exp_t;
 	template<typename, typename> struct max_exp_t;
+	template<typename, typename, typename> struct concat_exp_t;
 	template<typename> struct sqrt_exp_t;
+	template<typename Scalar, typename opExp_t, bool transpose = false> struct dup_exp_t;
+	template<typename > struct abs_exp_t;
+	template<typename Scalar, typename opExp_t> struct slice_exp_t;
 	template<typename, typename > struct map_exp_t;
 	template<typename T = float, typename std::enable_if<std::is_scalar<T>::value, int >::type = 0> struct scalar_t;
 	template<typename Scalar, typename T = gVector<Scalar>, typename std::enable_if<std::is_same<T, gVector<Scalar>>::value, int>::type = 0> struct var_t;
@@ -593,6 +643,8 @@ namespace gv {
 		const Scalar* data() const { return _data; }
 
 		size_t size() const { return _size; }
+
+		void move(Scalar* data_ptr, size_t size) { _data = data_ptr; _size = size; }
 
 		void clear(void);
 
@@ -633,7 +685,7 @@ namespace gv {
 				//}
 				return 0;
 			};
-			map << <grid_size, block_size >> > (_size, kernel);
+			gv::map << <grid_size, block_size >> > (_size, kernel);
 			cudaDeviceSynchronize();
 			cuda_error_check;
 		}
@@ -654,7 +706,10 @@ namespace gv {
 			set_filter_value(exprfilter, var_t<T>(repl_val));
 		}
 
-		void get(Scalar *host_ptr, size_t len, size_t offset = 0);
+		template<bool transpose = false>
+		dup_exp_t<Scalar, var_t<Scalar>> dup(int ndup, int nwordvalid, int nwordpitch) const;
+
+		void get(Scalar *host_ptr, size_t len, size_t offset = 0) const;
 
 		gVector(void) :_size(0), _data(nullptr) {}
 
@@ -848,7 +903,10 @@ namespace gv {
 			return sqrt(dot(*this));
 		}
 
-		Scalar infnorm(void) const { return parallel_maxabs(_data, buf_vector.data(), size()); }
+		Scalar infnorm(void) const {
+			Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * (size() / 300 + 1));
+			return parallel_maxabs(_data, pbuf, size());
+		}
 
 		Scalar sqrnorm(void) const { return dot(*this); }
 
@@ -866,38 +924,64 @@ namespace gv {
 
 		void clamp(gVector& vl, gVector& vu) { clamp(vl.data(), vu.data()); }
 
-		gVector slice(int start, int end) const;
+		slice_exp_t<Scalar, var_t<Scalar>> slice(int start, int end) const;
 
-		gVector concated_one(const gVector& v2) const;
+		//gVector concated_one(const gVector& v2) const;
 
-		gVector concated_one(Scalar val) const;
+		//gVector concated_one(Scalar val) const;
 
-		void concate_one(const gVector& v2);
+		//void concate_one(const gVector& v2);
 
-		void concate_one(Scalar val);
+		//void concate_one(Scalar val);
 
-		template<typename Arg0, typename... Args>
-		gVector concated(Arg0 arg0, Args... args) {
-			return concated_one(arg0).concated(args...);
+		//template<typename Arg0, typename... Args>
+		//gVector concated(Arg0 arg0, Args... args) {
+		//	return concated_one(arg0).concated(args...);
+		//}
+
+		//template<typename Arg0, typename... Args>
+		//void concate(const Arg0& arg0, Args... args) {
+		//	concate_one(arg0);
+		//	concate(args...);
+		//}
+
+		//void concate(void) { return; }
+
+		//gVector concated(void) const { return *this; }
+
+		template<typename T, typename std::enable_if<std::is_scalar<T>::value, int>::type = 0>
+		concat_exp_t<Scalar, var_t<Scalar>, var_t<T>> concat(const gVector<T>& v) {
+			return concat_exp_t<Scalar, var_t<Scalar>, var_t<T>>(var_t<Scalar>(*this), var_t<T>(v));
 		}
 
-		template<typename Arg0, typename... Args>
-		void concate(const Arg0& arg0, Args... args) {
-			concate_one(arg0);
-			concate(args...);
+		template<typename T, typename std::enable_if<std::is_scalar<T>::value, int>::type = 0>
+		concat_exp_t<Scalar, var_t<Scalar>, scalar_t<T>> concat(T v) {
+			return concat_exp_t<Scalar, var_t<Scalar>, scalar_t<T>>(var_t<Scalar>(*this), scalar_t<T>(v));
 		}
 
-		void concate(void) { return; }
+		template<typename opExp_t, typename std::enable_if<is_expression<opExp_t>::value, int>::type = 0>
+		concat_exp_t<Scalar, var_t<Scalar>, opExp_t> concat(const opExp_t& op) {
+			return concat_exp_t<Scalar, var_t<Scalar>, opExp_t>(var_t<Scalar>(*this), op);
+		}
 
-		gVector concated(void) const { return *this; }
+		template<typename T0, typename... T, typename std::enable_if < (sizeof...(T) >= 1), int>::type = 0 >
+		auto concat(const T0& op0, const T&... opex) {
+			return concat(op0).concat(opex...);
+		}
+
+		abs_exp_t<var_t<Scalar>> abs(void) {
+			return abs_exp_t<var_t<Scalar>>(var_t<Scalar>(*this));
+		}
 
 		std::vector<Scalar> slice2host(int start, int end) const;
 
 		static void Init(size_t max_vec_size) {
 			if (std::is_same<Scalar, double>::value) {
 				cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
+				std::cout << "[gv] use 8b bank" << std::endl;
 			} else if (std::is_same<Scalar, float>::value) {
 				cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeFourByte);
+				std::cout << "[gv] use 4b bank" << std::endl;
 			}
 			if (max_vec_size > buf_vector.size()) {
 				buf_vector.resize(max_vec_size);
@@ -905,9 +989,24 @@ namespace gv {
 		}
 
 
-		static Scalar* get_dump_buf(void) { return buf_vector.data(); }
+		static Scalar* get_dump_buf(size_t size_len) {
+			if (size_len < 1024) size_len = 1024;
+			if (size_len < buf_vector.size() * sizeof(Scalar)) { 
+				return buf_vector.data();
+			} else {
+				buf_vector.resize(round<sizeof(Scalar)>(size_len) / sizeof(Scalar));
+				return buf_vector.data();
+			}
+		}
 
 		Scalar sum(void) const;
+
+		void gatherPitch(Scalar* dst, int ncopyword, int nrow, int selfwordpitch, int ndstwordpitch);
+
+		void pitchSumInPlace(int batch_size, int nword, int wordpitch, bool sumcol = false);
+
+		template<typename WT>
+		void weightedPitchSumInPlace(int batch_size, int nword, int wordpitch, const WT* weight, bool sumcol = false);
 
 		Scalar dot(const gVector& v2) const;
 
@@ -921,6 +1020,24 @@ namespace gv {
 		Scalar* end(void) { return _data + _size; }
 
 		static gVectorMap<Scalar> Map(Scalar* ptr, size_t size) { return gVectorMap<Scalar>(ptr, size); }
+
+#if defined(GVECTOR_WITH_MATLAB)
+		template<typename std::enable_if<
+			std::is_same<Scalar, double>::value || 
+			std::is_same<Scalar, float>::value || 
+			std::is_same<Scalar, int>::value ||
+			std::is_same<Scalar, bool>::value, int>::type = 0>
+		void toMatlab(const char* name) const { pass_matrix_to_matlab(name, _data, _size, 1, _size, false); }
+
+		template<typename std::enable_if<
+			std::is_same<Scalar, double>::value || 
+			std::is_same<Scalar, float>::value || 
+			std::is_same<Scalar, int>::value ||
+			std::is_same<Scalar, bool>::value, int>::type = 0>
+		void toMatlab(const char* name, int rows, int cols, int wordpicth, bool rowmajor) const {
+			pass_matrix_to_matlab(name, _data, rows, cols, wordpicth, rowmajor);
+		}
+#endif
 	};
 
 
@@ -1090,7 +1207,7 @@ namespace gv {
 		Scalar* ptr = _data;
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map << <grid_size, block_size >> > (_data, size(), [=] __device__(int tid) { return ptr[tid] / s; });
+		gv::map << <grid_size, block_size >> > (_data, size(), [=] __device__(int tid) { return ptr[tid] / s; });
 		cudaDeviceSynchronize();
 		cuda_error_check;
 		return *this;
@@ -1101,7 +1218,7 @@ namespace gv {
 		Scalar* ptr = data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map << <grid_size, block_size >> > (ptr, size(), [=] __device__(int tid) { return 1 / ptr[tid]; });
+		gv::map << <grid_size, block_size >> > (ptr, size(), [=] __device__(int tid) { return 1 / ptr[tid]; });
 		cudaDeviceSynchronize();
 		cuda_error_check;
 		return;
@@ -1122,7 +1239,7 @@ namespace gv {
 		Scalar* ptr = data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map<<<grid_size,block_size>>>(data(), size(), [=] __device__(int tid) { return ptr[tid] * s; });
+		gv::map<<<grid_size,block_size>>>(data(), size(), [=] __device__(int tid) { return ptr[tid] * s; });
 		cudaDeviceSynchronize();
 		cuda_error_check;
 		return *this;
@@ -1140,7 +1257,7 @@ namespace gv {
 		Scalar* ptr = data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, len, 512);
-		map << <grid_size, block_size >> > (size(), [=] __device__(int tid) {
+		gv::map << <grid_size, block_size >> > (size(), [=] __device__(int tid) {
 			if (read_bit(filter, tid)) { ptr[tid] = val; }
 		});
 		cudaDeviceSynchronize();
@@ -1148,7 +1265,7 @@ namespace gv {
 	}
 
 	template <typename Scalar>
-	void gVector<Scalar>::get(Scalar *host_ptr, size_t len, size_t offset /*= 0*/) {
+	void gVector<Scalar>::get(Scalar *host_ptr, size_t len, size_t offset /*= 0*/) const {
 		size_t wlen = (len + offset) < size() ? len :  (size() - offset);
 		cudaMemcpy(host_ptr, data() + offset, wlen * sizeof(Scalar), cudaMemcpyDeviceToHost);
 		cuda_error_check;
@@ -1160,7 +1277,7 @@ namespace gv {
 		Scalar* ptr = data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map<<<grid_size,block_size>>>(ptr, size(), [=]  __device__(int tid) {
+		gv::map<<<grid_size,block_size>>>(ptr, size(), [=]  __device__(int tid) {
 			Scalar v = ptr[tid]; return v > s ? v : s;
 		});
 		cudaDeviceSynchronize();
@@ -1174,7 +1291,7 @@ namespace gv {
 		const Scalar* v2data = v2.data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map<<<grid_size,block_size>>>(v1data, size(), [=] __device__(int tid) {
+		gv::map<<<grid_size,block_size>>>(v1data, size(), [=] __device__(int tid) {
 			Scalar val1 = v1data[tid];
 			Scalar val2 = v2data[tid];
 			return val1 > val2 ? val1 : val2;
@@ -1189,7 +1306,7 @@ namespace gv {
 		Scalar* ptr = data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map<<<grid_size,block_size>>>(ptr, size(), [=] __device__(int tid) {
+		gv::map<<<grid_size,block_size>>>(ptr, size(), [=] __device__(int tid) {
 			Scalar v = ptr[tid];
 			return v < s ? v : s;
 		});
@@ -1204,7 +1321,7 @@ namespace gv {
 		const Scalar* v2data = v2.data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map<<<grid_size,block_size>>>(v1data, size(), [=] __device__(int tid) {
+		gv::map<<<grid_size,block_size>>>(v1data, size(), [=] __device__(int tid) {
 			Scalar val1 = v1data[tid];
 			Scalar val2 = v2data[tid];
 			return val1 < val2 ? val1 : val2;
@@ -1217,8 +1334,189 @@ namespace gv {
 	Scalar gVector<Scalar>::sum(void) const
 	{
 		//gVector tmp((size() + 511) / 512);
-		Scalar res = parallel_sum(data(), buf_vector.data(), size());
+		Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * (size() / 300 + 1));
+		Scalar res = parallel_sum(data(), pbuf, size());
 		return res;
+	}
+
+	template<typename Scalar, int BlockSize = 512>
+	__global__ void pitchSumInPlace_kernel(int nrows, int batch_size, Scalar* pdata, int nvar, int nvarpitch, Scalar* p_out, int nwpitchout) {
+		int nblockStride = round<BlockSize>(nvar) / BlockSize;
+		size_t eid = blockIdx.x % nblockStride * blockDim.x + threadIdx.x;
+		int batchid = blockIdx.x / nblockStride;
+
+		__shared__ volatile Scalar sum[BlockSize];
+
+		// DEBUG
+		int tid = threadIdx.x;
+
+		for (int batchoffset = 0; batchoffset < nrows; batchoffset += batch_size) {
+			int rowid = batchid + batchoffset;
+
+			// cache data to block memory
+			Scalar s = 0;
+			if (rowid < nrows && batchid < batch_size && eid < nvar) {
+				s = pdata[eid + rowid * nvarpitch];
+				//if (eid + rowid * nvarpitch >= (batchoffset + 1) * nvarpitch) printf("eid = %d\n", eid);
+				//if ((s > 1.001 || s < 0.999) && tid == 0) {
+				//	printf("[%d] s = %lf\n", eid, s);
+				//}
+			}
+			sum[tid] = s;
+			__syncthreads();
+			
+			// block reduce
+			//blockReduce<Scalar, BlockSize>(sum);
+			if (tid < 256) { sum[tid] += sum[tid + 256]; } __syncthreads();
+
+			if (tid < 128) { sum[tid] += sum[tid + 128]; } __syncthreads();
+
+			if (tid < 64) { sum[tid] += sum[tid + 64]; } __syncthreads();
+
+			if (tid < 32) {
+				sum[tid] += sum[tid + 32];
+				sum[tid] += sum[tid + 16];
+				sum[tid] += sum[tid + 8];
+				sum[tid] += sum[tid + 4];
+				sum[tid] += sum[tid + 2];
+				sum[tid] += sum[tid + 1];
+			}
+			//__syncthreads();
+
+			if (tid == 0 && rowid < nrows && batchid < batch_size && eid < nvar) {
+				//printf("-- sum = %lf\n", sum[0]);
+				//pdata[blockIdx.x % nblockStride + rowid * nvarpitch] = sum[0];
+				p_out[blockIdx.x % nblockStride + rowid * nwpitchout] = sum[0];
+			}
+			__syncthreads();
+		}
+	}
+
+	// only for m x n matrix, m << n
+	template<typename Scalar, int BlockSize = 512>
+	__global__ void pitchSumColumnInPlace_kernel(int nrows/*, int batch_size*/, Scalar* pdata, int nvar, int nvarpitch/*, int restheight*/) {
+		//int nblockStride = round<BlockSize>(nvarpitch) / BlockSize;
+		size_t eid = blockIdx.x * blockDim.x + threadIdx.x;
+		Scalar sum = 0;
+		if (eid >= nvar) return;
+		for (int i = 0; i < nrows; i++) {
+			sum += pdata[eid + i * nvarpitch];
+		}
+		pdata[eid] = sum;
+	}
+
+	template<typename Scalar>
+	void gVector<Scalar>::pitchSumInPlace(int batch_size, int nword, int wordpitch, bool sumcol /*= false*/) {
+		constexpr int BlockSize = 512;
+		int nrows = _size / wordpitch;
+		if (_size % wordpitch != 0) {
+			std::cout << "\033[31m" << "[gv] :" << __LINE__ << "not pitched size" << std::endl;
+		}
+		if (sumcol) {
+			size_t grid_size, block_size = BlockSize;
+			make_kernel_param(&grid_size, &block_size, nword, BlockSize);
+			pitchSumColumnInPlace_kernel << <grid_size, block_size >> > (nrows, _data, nword, wordpitch);
+			cudaDeviceSynchronize();
+			cuda_error_check;
+		} else {
+			while (nword > 1) {
+				int nblockStride = round<BlockSize>(nword) / BlockSize;
+				Scalar* pout = get_dump_buf(sizeof(Scalar) * nblockStride * nrows);
+				int nblock = batch_size * nblockStride;
+				pitchSumInPlace_kernel << <nblock, BlockSize >> > (nrows, batch_size, _data, nword, wordpitch, pout, nblockStride);
+				//cudaDeviceSynchronize();
+				cudaMemcpy2D(_data, wordpitch * sizeof(Scalar), pout, nblockStride * sizeof(Scalar), nblockStride * sizeof(Scalar), nrows, cudaMemcpyDeviceToDevice);
+				cuda_error_check;
+				nword = nblockStride;
+			}
+		}
+	}
+
+	template<typename Scalar, typename WT, int BlockSize = 512>
+	__global__ void weightPitchSumInPlace_kernel(int nrows, int batch_size, Scalar* pdata, int nvar, int nvarpitch, const WT* weight, Scalar* p_out, int nwpitchout) {
+		int nblockStride = round<BlockSize>(nvar) / BlockSize;
+		size_t eid = blockIdx.x % nblockStride * blockDim.x + threadIdx.x;
+		int batchid = blockIdx.x / nblockStride;
+
+		__shared__ volatile Scalar sum[BlockSize];
+
+		for (int batchoffset = 0; batchoffset < nrows; batchoffset += batch_size) {
+			int rowid = batchid + batchoffset;
+
+			// cache data to block memory
+			Scalar s = 0;
+			if (rowid < nrows && batchid < batch_size && eid < nvar) {
+				s = pdata[eid + rowid * nvarpitch] * weight[rowid];
+			}
+			sum[threadIdx.x] = s;
+			__syncthreads();
+			
+			// block reduce
+			blockReduce<Scalar, BlockSize>(sum);
+
+			if (threadIdx.x == 0 && rowid < nrows && batchid < batch_size && eid < nvar) {
+				//pdata[blockIdx.x % nblockStride + rowid * nvarpitch] = sum[0];
+				p_out[blockIdx.x % nblockStride + rowid * nwpitchout] = sum[0];
+			}
+			__syncthreads();
+		}
+	}
+
+	// only for m x n matrix, m << n
+	template<typename Scalar, typename WT, int BlockSize = 512>
+	__global__ void weightPitchSumColumnInPlace_kernel(int nrows/*, int batch_size*/, Scalar* pdata, int nvar, int nvarpitch/*, int restheight*/, const WT* weight) {
+		//int nblockStride = round<BlockSize>(nvarpitch) / BlockSize;
+		size_t eid = blockIdx.x * blockDim.x + threadIdx.x;
+		Scalar sum = 0;
+		//__shared__ WT W[BlockSize];
+		//WT w = 0;
+		//if (eid < nvar) {
+		//	w = weight[eid];
+		//}
+		//W[threadIdx.x] = w;
+		//__syncthreads();
+		if (eid >= nvar) return;
+		for (int i = 0; i < nrows; i++) {
+			sum += pdata[eid + i * nvarpitch] * weight[i];
+		}
+		pdata[eid] = sum;
+	}
+
+	template<typename Scalar>
+	template<typename WT>
+	void gVector<Scalar>::weightedPitchSumInPlace(int batch_size, int nword, int wordpitch, const WT* weight, bool sumcol /*= false*/) {
+		constexpr int BlockSize = 512;
+		int nrows = _size / wordpitch;
+		if (sumcol) {
+			size_t grid_size, block_size;
+			make_kernel_param(&grid_size, &block_size, nword, BlockSize);
+			weightPitchSumColumnInPlace_kernel<<<grid_size,block_size>>>(nrows, _data, nword, wordpitch, weight);
+			cudaDeviceSynchronize();
+			cuda_error_check;
+		}
+		else {
+			while (nword > 1) {
+				int nblockStride = round<BlockSize>(nword) / BlockSize;
+				Scalar* pout = get_dump_buf(sizeof(Scalar) * nblockStride * nrows);
+				int nblock = batch_size * nblockStride;
+				weightPitchSumInPlace_kernel << <nblock, BlockSize >> > (nrows, batch_size, _data, nword, wordpitch, weight, pout, nblockStride);
+				//cudaDeviceSynchronize();
+				cudaMemcpy2D(_data, wordpitch * sizeof(Scalar), pout, nblockStride * sizeof(Scalar), nblockStride * sizeof(Scalar), nrows, cudaMemcpyDeviceToDevice);
+				cuda_error_check;
+				nword = nblockStride;
+			}
+		}
+	}
+
+	template<typename Scalar>
+	template<bool transpose /*= false*/>
+	dup_exp_t<Scalar, var_t<Scalar>> gVector<Scalar>::dup(int ndup, int nwordvalid, int nwordpitch) const {
+		return dup_exp_t<Scalar, var_t<Scalar>, transpose>(var_t<Scalar>(*this), nwordvalid, nwordpitch, ndup);
+	}
+
+	template<typename Scalar>
+	void gVector<Scalar>::gatherPitch(Scalar* dst, int ncopyword, int nrow, int selfwordpitch, int ndstwordpitch) {
+		cudaMemcpy2D(dst, ndstwordpitch * sizeof(Scalar), _data, selfwordpitch * sizeof(Scalar), ncopyword * sizeof(Scalar), nrow, cudaMemcpyDeviceToDevice);
 	}
 
 	template<typename Scalar>
@@ -1233,7 +1531,7 @@ namespace gv {
 		};
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map<<<grid_size,block_size>>>(ptr, size(), clamp_kernel);
+		gv::map<<<grid_size,block_size>>>(ptr, size(), clamp_kernel);
 		cudaDeviceSynchronize();
 		cuda_error_check;
 	}
@@ -1244,7 +1542,7 @@ namespace gv {
 		Scalar* ptr = data();
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, _size, 512);
-		map<<<grid_size,block_size>>>(ptr, size(), [=] __device__(int eid) {
+		gv::map<<<grid_size,block_size>>>(ptr, size(), [=] __device__(int eid) {
 			Scalar val = ptr[eid];
 			Scalar low = lower[eid], up = upper[eid];
 			if (low > val) return low;
@@ -1256,18 +1554,8 @@ namespace gv {
 	}
 
 	template<typename Scalar>
-	gVector<Scalar> gVector<Scalar>::slice(int start, int end) const
-	{
-		gVector res(end - start);
-		const Scalar* ptr = data();
-		size_t grid_size, block_size;
-		make_kernel_param(&grid_size, &block_size, res.size(), 512);
-		map << <grid_size, block_size >> > (res.data(), res.size(), [=]  __device__(int eid) {
-			return ptr[eid + start];
-		});
-		cudaDeviceSynchronize();
-		cuda_error_check;
-		return res;
+	slice_exp_t<Scalar, var_t<Scalar>> gVector<Scalar>::slice(int start, int end) const {
+		return slice_exp_t<Scalar, var_t<Scalar>>(*this, start, end);
 	}
 
 
@@ -1285,17 +1573,20 @@ namespace gv {
 
 	template<typename Scalar>
 	Scalar gVector<Scalar>::dot(const gVector<Scalar>& v2) const {
-		return gv::dot(data(), v2.data(), buf_vector.data(), size());
+		Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * (size() / 300 + 1));
+		return gv::dot(data(), v2.data(), pbuf, size());
 	}
 
 	template<typename Scalar>
 	Scalar gVector<Scalar>::max(void) const {
-		return parallel_max(data(), buf_vector.data(), size());
+		Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * (size() / 300 + 1));
+		return parallel_max(data(), pbuf, size());
 	}
 
 	template<typename Scalar>
 	Scalar gVector<Scalar>::min(void) const {
-		return parallel_min(data(), buf_vector.data(), size());
+		Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * (size() / 300 + 1));
+		return parallel_min(data(), pbuf, size());
 	}
 
 	template<typename Scalar>
@@ -1304,7 +1595,7 @@ namespace gv {
 		Scalar* src = _data;
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, size(), 512);
-		map << <grid_size, block_size >> > (tmp.data(), size(), [=] __device__(int eid) {
+		gv::map << <grid_size, block_size >> > (tmp.data(), size(), [=] __device__(int eid) {
 			Scalar val = src[eid];
 			if (val < 0) {
 				val = 1e30;
@@ -1322,52 +1613,52 @@ namespace gv {
 		size_t grid_size, block_size;
 		make_kernel_param(&grid_size, &block_size, size(), 512);
 		Scalar* src = _data;
-		map << <grid_size, block_size >> > (_data, size(), [=] __device__(int tid) {
+		gv::map << <grid_size, block_size >> > (_data, size(), [=] __device__(int tid) {
 			return sqrt(src[tid]);
 		});
 		cudaDeviceSynchronize();
 		cuda_error_check;
 	}
 
-	template<typename Scalar>
-	gVector<Scalar> gVector<Scalar>::concated_one(const gVector<Scalar>& v2) const {
-		gVector result(size() + v2.size());
-		cudaMemcpy(result.data(), data(), sizeof(Scalar)*size(), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(result.data() + size(), v2.data(), sizeof(Scalar)*v2.size(), cudaMemcpyDeviceToDevice);
-		cuda_error_check;
-		return result;
-	}
+	//template<typename Scalar>
+	//gVector<Scalar> gVector<Scalar>::concated_one(const gVector<Scalar>& v2) const {
+	//	gVector result(size() + v2.size());
+	//	cudaMemcpy(result.data(), data(), sizeof(Scalar)*size(), cudaMemcpyDeviceToDevice);
+	//	cudaMemcpy(result.data() + size(), v2.data(), sizeof(Scalar)*v2.size(), cudaMemcpyDeviceToDevice);
+	//	cuda_error_check;
+	//	return result;
+	//}
 
-	template<typename Scalar>
-	gVector<Scalar> gVector<Scalar>::concated_one(Scalar val) const {
-		gVector result(size() + 1);
-		cudaMemcpy(result.data(), data(), size() * sizeof(Scalar), cudaMemcpyDeviceToDevice);
-		result[size()] = val;
-		cuda_error_check;
-		return result;
-	}
+	//template<typename Scalar>
+	//gVector<Scalar> gVector<Scalar>::concated_one(Scalar val) const {
+	//	gVector result(size() + 1);
+	//	cudaMemcpy(result.data(), data(), size() * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+	//	result[size()] = val;
+	//	cuda_error_check;
+	//	return result;
+	//}
 
-	template<typename Scalar>
-	void gVector<Scalar>::concate_one(const gVector<Scalar>& v2) {
-		gVector old_vec = *this;
-		size_t new_size = v2.size() + size();
-		clear();
-		build(new_size);
-		cudaMemcpy(data(), old_vec.data(), sizeof(Scalar)*old_vec.size(), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(data() + old_vec.size(), v2.data(), sizeof(Scalar)*v2.size(), cudaMemcpyDeviceToDevice);
-		cuda_error_check;
-	}
+	//template<typename Scalar>
+	//void gVector<Scalar>::concate_one(const gVector<Scalar>& v2) {
+	//	gVector old_vec = *this;
+	//	size_t new_size = v2.size() + size();
+	//	clear();
+	//	build(new_size);
+	//	cudaMemcpy(data(), old_vec.data(), sizeof(Scalar)*old_vec.size(), cudaMemcpyDeviceToDevice);
+	//	cudaMemcpy(data() + old_vec.size(), v2.data(), sizeof(Scalar)*v2.size(), cudaMemcpyDeviceToDevice);
+	//	cuda_error_check;
+	//}
 
-	template<typename Scalar>
-	void gVector<Scalar>::concate_one(Scalar val) {
-		gVector old_vec = *this;
-		size_t new_size = size() + 1;
-		clear();
-		build(new_size);
-		cudaMemcpy(data(), old_vec.data(), old_vec.size() * sizeof(Scalar), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(data() + old_vec.size(), &val, sizeof(Scalar), cudaMemcpyHostToDevice);
-		cuda_error_check;
-	}
+	//template<typename Scalar>
+	//void gVector<Scalar>::concate_one(Scalar val) {
+	//	gVector old_vec = *this;
+	//	size_t new_size = size() + 1;
+	//	clear();
+	//	build(new_size);
+	//	cudaMemcpy(data(), old_vec.data(), old_vec.size() * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+	//	cudaMemcpy(data() + old_vec.size(), &val, sizeof(Scalar), cudaMemcpyHostToDevice);
+	//	cuda_error_check;
+	//}
 
 /*
 ************************************************************************************
@@ -1455,12 +1746,12 @@ namespace gv {
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
 			subExp_t graph1 = *p_ex;
 			opExp_t graph2 = op2;
-			Scalar* pbuf = gVector<Scalar>::get_dump_buf();
 			//printf("pbuf = %p\n", pbuf);
 			int n = op2.size();
 			size_t grid_size, block_size;
 			make_kernel_param(&grid_size, &block_size, n, 512);
 			cuda_error_check;
+			Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar)* grid_size);
 			dot_graph_kernel << <grid_size, block_size >> > (pbuf, n, graph1, graph2);
 			cudaDeviceSynchronize();
 			cuda_error_check;
@@ -1471,11 +1762,11 @@ namespace gv {
 		Scalar sum(void)const {
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
 			subExp_t graph = *p_ex;
-			Scalar* pbuf = gVector<Scalar>::get_dump_buf();
 			int n = graph.size();
 			size_t grid_size, block_size;
 			make_kernel_param(&grid_size, &block_size, n, 512);
 			cuda_error_check;
+			Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * grid_size);
 			sum_graph_kernel << <grid_size, block_size >> > (pbuf, n, graph);
 			cudaDeviceSynchronize();
 			cuda_error_check;
@@ -1486,11 +1777,11 @@ namespace gv {
 		Scalar sqrnorm(void) {
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
 			subExp_t graph = *p_ex;
-			Scalar* pbuf = gVector<Scalar>::get_dump_buf();
 			int n = graph.size();
 			size_t grid_size, block_size;
 			make_kernel_param(&grid_size, &block_size, n, 512);
 			cuda_error_check;
+			Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * grid_size);
 			sqrnorm_graph_kernel << <grid_size, block_size >> > (pbuf, n, graph);
 			cudaDeviceSynchronize();
 			cuda_error_check;
@@ -1501,11 +1792,11 @@ namespace gv {
 		Scalar max(void) {
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
 			subExp_t graph = *p_ex;
-			Scalar* pbuf = gVector<Scalar>::get_dump_buf();
 			int n = graph.size();
 			size_t grid_size, block_size;
 			make_kernel_param(&grid_size, &block_size, n, 512);
 			cuda_error_check;
+			Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * grid_size);
 			max_graph_kernel << <grid_size, block_size >> > (pbuf, n, graph);
 			cudaDeviceSynchronize();
 			cuda_error_check;
@@ -1516,11 +1807,11 @@ namespace gv {
 		Scalar min(void) {
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
 			subExp_t graph = *p_ex;
-			Scalar* pbuf = gVector<Scalar>::get_dump_buf();
 			int n = graph.size();
 			size_t grid_size, block_size;
 			make_kernel_param(&grid_size, &block_size, n, 512);
 			cuda_error_check;
+			Scalar* pbuf = gVector<Scalar>::get_dump_buf(sizeof(Scalar) * grid_size);
 			min_graph_kernel << <grid_size, block_size >> > (pbuf, n, graph);
 			cudaDeviceSynchronize();
 			cuda_error_check;
@@ -1532,13 +1823,61 @@ namespace gv {
 			return sqrt(sqrnorm());
 		}
 
-		void toMatlab(const char* name) {
-#if defined(__GVECTOR_WITH_MATLAB)  
+		//template<typename opExp_t, typename std::enable_if<is_expression<opExp_t>::value, int>::type = 0>
+		//min_exp_t<subExp_t, opExp_t> min(const opExp_t& op2) const {
+		//	const subExp_t* p_ex = static_cast<const subExp_t*>(this);
+		//	return min_exp_t<subExp_t, opExp_t>(*p_ex, op2);
+		//}
+		template<typename opExp_t, typename std::enable_if<is_expression<opExp_t>::value, int>::type = 0>
+		concat_exp_t<Scalar, subExp_t, opExp_t> concat(const opExp_t& op) {
+			return concat_exp_t<Scalar, subExp_t, opExp_t>(*static_cast<const subExp_t*>(this), op);
+		}
+
+		template<typename T, typename std::enable_if<std::is_scalar<T>::value, int>::type = 0>
+		concat_exp_t<Scalar, subExp_t, var_t<T>> concat(const gVector<T>& v) {
+			return concat_exp_t<Scalar, subExp_t, var_t<T>>(*static_cast<const subExp_t*>(this), var_t<T>(v));
+		}
+
+		template<typename T, typename std::enable_if<std::is_scalar<T>::value, int>::type = 0>
+		concat_exp_t<Scalar, subExp_t, scalar_t<T>> concat(T v) {
+			return concat_exp_t<Scalar, subExp_t, scalar_t<T>>(*static_cast<const subExp_t*>(this), scalar_t<T>(v));
+		}
+
+		template<typename T0, typename... T, typename std::enable_if < (sizeof...(T) >= 1), int>::type = 0 >
+		auto concat(const T0& op0, const T&... opex) {
+			return concat(op0).concat(opex...);
+		}
+
+		abs_exp_t<subExp_t> abs(void) {
+			return abs_exp_t<subExp_t>(*static_cast<const subExp_t*>(this));
+		}
+		
+		template<bool transpose = false>
+		dup_exp_t<Scalar, subExp_t, transpose> dup(int ndup, int nwordvalid, int nwordpitch) const {
+			return dup_exp_t<Scalar, subExp_t, transpose>(*static_cast<const subExp_t*>(this), nwordvalid, nwordpitch, ndup);
+		}
+
+		slice_exp_t<Scalar, subExp_t> slice(int start, int end) const {
+			return slice_exp_t<Scalar, subExp_t>(*static_cast<const subExp_t*>(this), start, end);
+		}
+
+		void toMatlab(const char* name) const {
+#if defined(GVECTOR_WITH_MATLAB)  
 			const subExp_t* p_ex = static_cast<const subExp_t*>(this);
 			subExp_t graph = *p_ex;
-			gVector vec = graph;
+			gVector<Scalar> vec = graph;
 			vec.toMatlab(name);
 #endif
+		}
+
+		template<typename std::enable_if<
+			std::is_same<Scalar, double>::value || 
+			std::is_same<Scalar, float>::value || 
+			std::is_same<Scalar, int>::value ||
+			std::is_same<Scalar, bool>::value, int>::type = 0>
+			void toMatlab(const char* name, int rows, int cols, int wordpicth, bool rowmajor) const {
+			gVector<Scalar> vec = *static_cast<const subExp_t*>(this);
+			vec.toMatlab(name, rows, cols, wordpicth, rowmajor);
 		}
 
 	};
@@ -1574,7 +1913,89 @@ struct scalar_t
 		return scalar;
 	}
 	__host__ __device__ int size(void) const {
-		return 0;
+		return 1;
+	}
+};
+
+template<typename Scalar, typename opExp_t, bool transpose/* = false*/>
+struct dup_exp_t
+	: exp_t<Scalar, dup_exp_t<Scalar, opExp_t>>
+{
+	opExp_t exp;
+	int nwordpitch;
+	int ndup;
+	int nwordvalid;
+	typedef Scalar Scalar;
+	__host__ __device__ dup_exp_t(const opExp_t& opexp, int nwvalid, int nwpitch, int ndp) : exp(opexp), nwordvalid(nwvalid), nwordpitch(nwpitch), ndup(ndp) {}
+	__host__ __device__ int size(void) const {
+		if (!transpose) {
+			return nwordpitch * ndup;
+		} else {
+			return nwordpitch * exp.size();
+		}
+	}
+	__device__ Scalar eval(int eid) const {
+		int k = eid % nwordpitch;
+#if 0
+		if (k < exp.size()) {
+			return exp.eval(eid % nwordpitch);
+		}
+		else {
+			return Scalar(0);
+		}
+#else
+		if (!transpose) {
+			if (k >= nwordvalid) {
+				return Scalar(0);
+			} else {
+				return exp.eval(k);
+			}
+		} else {
+			if (k >= nwordvalid) {
+				return Scalar(0);
+			} else {
+				return exp.eval(eid / nwordpitch);
+			}
+		}
+#endif
+	}
+};
+
+template<typename Scalar, typename opExp1_t, typename opExp2_t>
+struct concat_exp_t
+	: exp_t<Scalar, concat_exp_t<Scalar, opExp1_t, opExp2_t>>
+{
+	typedef Scalar Scalar;
+	opExp1_t exp1;
+	opExp2_t exp2;
+	__host__ __device__ concat_exp_t(const opExp1_t& op1, const opExp2_t& op2)
+		: exp1(op1), exp2(op2) { }
+	__host__ __device__ int size(void) const {
+		return exp1.size() + exp2.size();
+	}
+	__device__ Scalar eval(int eid) const {
+		int s1 = exp1.size();
+		if (eid >= s1) {
+			return exp2.eval(eid - s1);
+		} else {
+			return exp1.eval(eid);
+		}
+	}
+};
+
+template<typename Scalar, typename opExp_t>
+struct slice_exp_t
+	: exp_t<Scalar, slice_exp_t<Scalar, opExp_t>>
+{
+	typedef Scalar Scalar;
+	opExp_t exp0;
+	size_t start, end;
+	__host__ __device__ slice_exp_t(const opExp_t& op, size_t start_id, size_t end_id) :exp0(op), start(start_id), end(end_id) {}
+	__host__ __device__ int size(void) const {
+		return end - start;
+	}
+	__device__ Scalar eval(int eid) const {
+		return exp0.eval(eid + start);
 	}
 };
 
@@ -1609,6 +2030,18 @@ template<typename opExp_t, typename std::enable_if<is_expression<opExp_t>::value
 negat_exp_t<opExp_t> operator-(const opExp_t& opexp) {
 	return negat_exp_t<opExp_t>(opexp);
 }
+
+template<typename opExp_t>
+struct abs_exp_t
+	:unary_exp_t<typename exp_scalar_t<opExp_t>, abs_exp_t<opExp_t>, opExp_t>
+{
+	typedef unary_exp_t<typename exp_scalar_t<opExp_t>, abs_exp_t<opExp_t>, opExp_t> baseType;
+	typedef typename baseType::Scalar Scalar;
+	__host__ __device__ abs_exp_t(const opExp_t& ex) : baseType(ex) {}
+	__device__ Scalar eval(int eid) const {
+		return ::abs(baseType::exp.eval(eid));
+	}
+};
 
 template<typename opExp_t>
 struct sqrt_exp_t
@@ -2157,6 +2590,26 @@ struct is_expression < var_t<_T, gVector<_T>, V>> {
 //struct is_expression<negat_exp_t<_T...>> {
 //	static constexpr bool value = true;
 //};
+
+template<typename T1, typename T2, bool b>
+struct is_expression<dup_exp_t<T1, T2, b>> {
+	static constexpr bool value = true;
+};
+
+template<typename... T>
+struct is_expression<slice_exp_t<T...>> {
+	static constexpr bool value = true;
+};
+
+template<typename... T>
+struct is_expression<abs_exp_t<T...>> {
+	static constexpr bool value = true;
+};
+
+template<typename... _T>
+struct is_expression<concat_exp_t<_T...>> {
+	static constexpr bool value = true;
+};
 
 template<typename... _T>
 struct is_expression<add_exp_t<_T...>> {
